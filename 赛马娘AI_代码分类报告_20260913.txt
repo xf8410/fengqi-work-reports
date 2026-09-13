@@ -1,0 +1,1085 @@
+====================================================================
+赛马娘 AI 助手 —— 代码分类报告（2026-09-13）
+说明：本文件收录本轮"反摆烂 + SO 插件"工作写的全部代码，按仓库/软件分类。
+纯 UTF-8 文本，直接打开即可阅读。配套文件：《赛马娘AI_进度交接报告_20260913.txt》
+====================================================================
+
+################################################################
+【仓库一】xf8410/hlpatch —— hachimi 赛马娘 SO 插件（手机端注入插件）
+说明：这个仓库产出安装到手机上的 .so 插件。main 分支只放"基底"，
+功能代码靠构建时的幂等补丁脚本一层层贴上去，CI 每次从干净基底重建。
+本轮交付版本：v3.28.1（训练动画跳过 + 版本号单源化），Release 已发布。
+################################################################
+
+----------------------------------------------------------------
+1.1 训练动画跳过模块（完整源码）
+文件：hachimi_ura_plugin/src/training_anim_skip.rs
+作用：游戏里训练结算动画播 1.5~3 秒，此模块在动画初始化时自动跳过，
+     一回合能省好几秒。支持开关（供以后 GUI 按钮用）。
+----------------------------------------------------------------
+//! ===== Training animation skip (D-T1) =====
+//!
+//! Auto-skips in-training cut-in animations (育成内演出) by hooking the
+//! game's own cut-in helper entry point and invoking the built-in skip
+//! routine on the same instance right after the original Init completes.
+//!
+//! Primary target : Gallop.SingleModeTrainingCutInHelper.Init -> .SkipRuntime
+//! Secondary      : Gallop.CampaignTrainingCutInHelper.Init  -> .SkipRuntime (best effort)
+//!
+//! Safety: disabled by default. Flip with:
+//!   GET /api/training/anim_skip/on   (enable)
+//!   GET /api/training/anim_skip/off  (disable)
+//! Status: GET /api/training/anim_skip
+
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
+static INIT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SKIP_ADDR: AtomicUsize = AtomicUsize::new(0);
+static CAMPAIGN_INIT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static CAMPAIGN_SKIP_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SKIP_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Acquire)
+}
+
+pub fn set_enabled(value: bool) {
+    ENABLED.store(value, Ordering::Release);
+}
+
+extern "C" fn init_hook(this: *mut c_void) -> *const c_void {
+    unsafe {
+        let trampoline = super::interceptor_get_trampoline(init_hook as usize);
+        if trampoline == 0 {
+            return std::ptr::null();
+        }
+        type FnType = unsafe extern "C" fn(*mut c_void) -> *const c_void;
+        let original: FnType = std::mem::transmute(trampoline);
+        let result = original(this);
+        // Auto-skip right after the cut-in helper initializes. SkipRuntime is
+        // the same routine the in-game skip button triggers; calling it here
+        // finishes the cut-in instantly without touching result state.
+        if is_enabled() && !this.is_null() {
+            let skip = SKIP_ADDR.load(Ordering::Acquire);
+            if skip != 0 {
+                type SkipFn = unsafe extern "C" fn(*mut c_void);
+                let skip_fn: SkipFn = std::mem::transmute(skip);
+                skip_fn(this);
+                SKIP_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        result
+    }
+}
+
+extern "C" fn campaign_init_hook(this: *mut c_void) -> *const c_void {
+    unsafe {
+        let trampoline = super::interceptor_get_trampoline(campaign_init_hook as usize);
+        if trampoline == 0 {
+            return std::ptr::null();
+        }
+        type FnType = unsafe extern "C" fn(*mut c_void) -> *const c_void;
+        let original: FnType = std::mem::transmute(trampoline);
+        let result = original(this);
+        if is_enabled() && !this.is_null() {
+            let skip = CAMPAIGN_SKIP_ADDR.load(Ordering::Acquire);
+            if skip != 0 {
+                type SkipFn = unsafe extern "C" fn(*mut c_void);
+                let skip_fn: SkipFn = std::mem::transmute(skip);
+                skip_fn(this);
+                SKIP_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        result
+    }
+}
+
+unsafe fn resolve_method(class: *mut c_void, name: &str, parameter_counts: &[i32]) -> usize {
+    let api = &*super::API;
+    match api.il2cpp_get_method_addr_fn {
+        Some(get_method_addr) => {
+            for count in parameter_counts {
+                let addr = get_method_addr(class as usize, super::to_cstr(name).as_ptr(), *count);
+                if addr != 0 {
+                    return addr;
+                }
+            }
+            0
+        }
+        None => 0,
+    }
+}
+
+fn install_pair(
+    label: &str,
+    namespace_name: &str,
+    class_name: &str,
+    init_out: &AtomicUsize,
+    skip_out: &AtomicUsize,
+) -> bool {
+    unsafe {
+        if super::API.is_null() {
+            super::set_hook_status(label, "failed: api_null");
+            return false;
+        }
+        let api = &*super::API;
+        if api.interceptor == 0 {
+            super::set_hook_status(label, "failed: interceptor_unavailable");
+            return false;
+        }
+        let get_image = match api.il2cpp_get_assembly_image_fn {
+            Some(v) => v,
+            None => {
+                super::set_hook_status(label, "failed: assembly_api_unavailable");
+                return false;
+            }
+        };
+        let get_class = match api.il2cpp_get_class_fn {
+            Some(v) => v,
+            None => {
+                super::set_hook_status(label, "failed: class_api_unavailable");
+                return false;
+            }
+        };
+        let image = get_image(super::to_cstr("umamusume.dll").as_ptr());
+        if image.is_null() {
+            super::set_hook_status(label, "failed: image_not_found");
+            return false;
+        }
+        let class = get_class(image, super::to_cstr(namespace_name).as_ptr(), super::to_cstr(class_name).as_ptr());
+        if class.is_null() {
+            super::set_hook_status(label, "failed: class_not_found");
+            return false;
+        }
+        // Init/SkipRuntime are typically parameterless; probe 0 then 1 args.
+        let skip = resolve_method(class, "SkipRuntime", &[0, 1]);
+        if skip == 0 {
+            super::set_hook_status(label, "failed: skip_runtime_unresolved");
+            return false;
+        }
+        skip_out.store(skip, Ordering::Release);
+        if init_out.load(Ordering::Acquire) != 0 {
+            super::set_hook_status(label, "already_installed");
+            return true;
+        }
+        let init = resolve_method(class, "Init", &[0, 1]);
+        if init == 0 || !super::interceptor_hook(init, init_hook as usize) {
+            super::set_hook_status(label, "failed: init_resolve_or_hook");
+            return false;
+        }
+        init_out.store(init, Ordering::Release);
+        super::set_hook_status(label, &format!("hooked@0x{:x} skip@0x{:x}", init, skip));
+        true
+    }
+}
+
+pub unsafe fn install() {
+    // Primary: regular scenario training cut-ins.
+    let _primary_ok = install_pair(
+        "training.anim_skip",
+        "Gallop",
+        "SingleModeTrainingCutInHelper",
+        &INIT_ADDR,
+        &SKIP_ADDR,
+    );
+    // Best effort: campaign ticket training uses a separate helper class in
+    // some builds. Failure here is non-fatal.
+    let _campaign_ok = install_pair(
+        "training.anim_skip.campaign",
+        "Gallop",
+        "CampaignTrainingCutInHelper",
+        &CAMPAIGN_INIT_ADDR,
+        &CAMPAIGN_SKIP_ADDR,
+    );
+}
+
+pub fn endpoint() -> String {
+    let installed = INIT_ADDR.load(Ordering::Acquire) != 0;
+    let campaign_installed = CAMPAIGN_INIT_ADDR.load(Ordering::Acquire) != 0;
+    format!(
+        r#"{{"ok":true,"feature":"training_anim_skip","enabled":{},"installed":{},"campaign_installed":{},"skip_calls":{},"usage":"GET /api/training/anim_skip/on|off to toggle; skips run only while enabled"}}"#,
+        is_enabled(),
+        installed,
+        campaign_installed,
+        SKIP_CALLS.load(Ordering::Acquire),
+    )
+}
+
+pub fn enable_endpoint() -> String {
+    set_enabled(true);
+    endpoint()
+}
+
+pub fn disable_endpoint() -> String {
+    set_enabled(false);
+    endpoint()
+}
+
+----------------------------------------------------------------
+1.2 动画跳过功能的集成脚本（构建时自动贴补丁，幂等：跑一百遍结果一样）
+文件：scripts/apply_training_anim_skip.py
+作用：把上面的模块声明、开关端点路由、安装钩子，精确插入 lib.rs 的
+     五个锚点位置；每个锚点先断言"全文唯一"，防贴错。
+----------------------------------------------------------------
+from pathlib import Path
+
+SOURCE = Path("hachimi_ura_plugin/src/lib.rs")
+MARKER = "// ===== Training animation skip D-T1 ====="
+s = SOURCE.read_text(encoding="utf-8")
+if MARKER in s:
+    print("training_anim_skip=already_applied")
+    raise SystemExit(0)
+
+# 1. module declaration
+module_anchor = "#![allow(dead_code)]\n"
+assert s.count(module_anchor) == 1, f"module anchor count={s.count(module_anchor)}"
+s = s.replace(module_anchor, module_anchor + "mod training_anim_skip;\n", 1)
+
+# 2. boot-safe exact routes (status/toggle stay available pre-game-init)
+boot_anchor = '"/api/sniff/signup_plaintext",'
+assert boot_anchor in s, "signup boot-safe anchor missing"
+for route in ('"/api/training/anim_skip"', '"/api/training/anim_skip/on"', '"/api/training/anim_skip/off"'):
+    if route not in s:
+        s = s.replace(boot_anchor, boot_anchor + "\n    " + route + ",", 1)
+
+# 3. route dispatch (exact-path style, mirrors sibling observers)
+route_anchor = '    } else if path == "/api/sniff/signup_plaintext" {\n'
+assert route_anchor in s, "route dispatch anchor missing"
+dispatch_block = (
+    '    } else if path == "/api/training/anim_skip" {\n'
+    "        training_anim_skip::endpoint()\n"
+    '    } else if path == "/api/training/anim_skip/on" {\n'
+    "        training_anim_skip::enable_endpoint()\n"
+    '    } else if path == "/api/training/anim_skip/off" {\n'
+    "        training_anim_skip::disable_endpoint()\n"
+)
+s = s.replace(route_anchor, dispatch_block + route_anchor, 1)
+
+# 4. installer invocation: piggyback on install_api_sniff_hooks, which the
+# game calls during initialization, fallback probing and manual toggles.
+# Same pattern as the TextCommon observer integration.
+install_anchor = "unsafe fn install_api_sniff_hooks() {\n"
+assert s.count(install_anchor) == 1, f"install anchor count={s.count(install_anchor)}"
+s = s.replace(
+    install_anchor,
+    install_anchor + "    training_anim_skip::install();\n",
+    1,
+)
+
+# 5. source marker for idempotency bookkeeping
+source_anchor = "/// 辅助函数：IL2CPP类型枚举转可读名称\n"
+assert s.count(source_anchor) == 1, f"source marker anchor count={s.count(source_anchor)}"
+s = s.replace(source_anchor, MARKER + "\n" + source_anchor, 1)
+
+SOURCE.write_text(s, encoding="utf-8")
+print("training_anim_skip=applied")
+
+----------------------------------------------------------------
+1.3 版本号单源化（本轮修复的核心问题）
+背景：以前版本号硬编码散落在 21 处，改了这头漏那头，
+     导致查询工具显示的还是旧版本（比如一直显示 3.22.91）。
+----------------------------------------------------------------
+1.3a 版本号递增脚本：scripts/bump_plugin_version.py
+作用：版本号只在这一个脚本里改，改完自动同步三处（lib.rs 常量 /
+     Cargo.toml / GUI 显示），保证三处永远一致。
+----------------------------------------------------------------
+#!/usr/bin/env python3
+"""Robust idempotent version bump for hachimi_ura_plugin.
+
+Usage: python3 scripts/bump_plugin_version.py <target-version>
+
+Bumps Cargo.toml and Cargo.lock from ANY current version to the target,
+so release pipelines never die on a drifted literal anchor (the old
+replace('version = "3.27.9"', ...) chain silently no-oped when the
+starting version had moved, which blocked releases). The final state is
+asserted, keeping the deterministic contract of the old approach.
+"""
+import re
+import sys
+from pathlib import Path
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: bump_plugin_version.py <target-version>")
+    target = sys.argv[1].strip()
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", target):
+        raise SystemExit(f"invalid semver target: {target!r}")
+
+    cargo = Path("hachimi_ura_plugin/Cargo.toml")
+    text = cargo.read_text(encoding="utf-8")
+    new_text, n = re.subn(
+        r'(?m)^version = "[0-9]+\.[0-9]+\.[0-9]+"$',
+        f'version = "{target}"',
+        text,
+        count=1,
+    )
+    if n != 1:
+        raise RuntimeError(f"Cargo.toml package version line not found (count={n})")
+    cargo.write_text(new_text, encoding="utf-8")
+
+    lock = Path("hachimi_ura_plugin/Cargo.lock")
+    lock_text = lock.read_text(encoding="utf-8")
+    pattern = re.compile(r'(name = "hachimi_ura"\nversion = ")[0-9]+\.[0-9]+\.[0-9]+(")')
+    new_lock, m = pattern.subn(rf"\g<1>{target}\g<2>", lock_text, count=1)
+    if m != 1:
+        raise RuntimeError(f"Cargo.lock hachimi_ura package block not found (count={m})")
+    lock.write_text(new_lock, encoding="utf-8")
+
+    # final-state contract (same guarantee the old literal asserts gave)
+    assert f'version = "{target}"' in cargo.read_text(encoding="utf-8")
+    assert f'name = "hachimi_ura"\nversion = "{target}"' in lock.read_text(encoding="utf-8")
+    print(f"bumped to {target}")
+
+
+if __name__ == "__main__":
+    main()
+
+----------------------------------------------------------------
+1.3b 运行时动态版本补丁：scripts/apply_dynamic_version.py
+作用：把插件里"写死的版本号字符串"替换成读取统一版本常量，
+     从根上消灭硬编码。
+----------------------------------------------------------------
+#!/usr/bin/env python3
+"""Single-source the runtime-reported plugin version.
+
+Background: ~30 endpoint responses carried a hardcoded "version":"3.22.91"
+string, so query clients (e.g. Agora) saw an ancient version even though
+the injected .so was current. This patch rewrites every such literal to a
+format placeholder backed by PLUGIN_VERSION (env!(CARGO_PKG_VERSION)), and
+fixes the load banner, so the reported version always equals the Cargo
+version that the release pipeline bumps.
+
+Idempotent: once no literal remains, re-runs print already_applied.
+"""
+from pathlib import Path
+
+SOURCE = Path("hachimi_ura_plugin/src/lib.rs")
+LITERAL = '"version":"3.22.91"'
+REPLACED = '"version":"{}"'
+
+s = SOURCE.read_text(encoding="utf-8")
+if LITERAL not in s:
+    print("dynamic_version=already_applied")
+    raise SystemExit(0)
+
+lines = s.split("\n")
+out = []
+fixed = 0
+for idx, line in enumerate(lines):
+    if LITERAL in line and line.strip().startswith('r#"') and line.rstrip().endswith('"#,'):
+        prev = lines[idx - 1].rstrip() if idx > 0 else ""
+        if not prev.endswith("format!("):
+            raise RuntimeError(
+                f"line {idx + 1}: expected 'format!(' on the previous line, got: {prev!r}"
+            )
+        if line.count(LITERAL) != 1:
+            raise RuntimeError(f"line {idx + 1}: unexpected literal count")
+        indent = len(line) - len(line.lstrip())
+        out.append(line.replace(LITERAL, REPLACED, 1))
+        out.append(" " * (indent + 4) + "PLUGIN_VERSION,")
+        fixed += 1
+    else:
+        out.append(line)
+
+banner_old = 'ura_log(3, "URA plugin v3.24.9 loaded (Interceptor API hooks)");'
+banner_new = (
+    'ura_log(3, &format!("URA plugin v{} loaded (Interceptor API hooks)", PLUGIN_VERSION));'
+)
+result = "\n".join(out)
+if banner_old in result:
+    assert result.count(banner_old) == 1, "load banner anchor count != 1"
+    result = result.replace(banner_old, banner_new, 1)
+
+if LITERAL in result:
+    raise RuntimeError(
+        f"{result.count(LITERAL)} hardcoded version literals could not be converted"
+    )
+
+SOURCE.write_text(result, encoding="utf-8")
+print(f"dynamic_version=applied json_fields={fixed} banner=fixed")
+
+----------------------------------------------------------------
+1.4 发布流水线（CI 配方）
+----------------------------------------------------------------
+1.4a 功能构建验证：.github/workflows/build-training-anim-skip.yml
+----------------------------------------------------------------
+name: Build Training Anim Skip
+
+on:
+  push:
+    branches:
+      - workbench/training-anim-skip-20260826
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate cumulative source, integrate anim-skip, verify idempotency
+        run: |
+          set -euo pipefail
+          python3 scripts/run_generated_succession_l_cumulative.py
+          python3 tooling/apply_turn_event_json_export.py
+          python3 scripts/apply_signup_plaintext_observer.py || true
+          cargo generate-lockfile --manifest-path hachimi_ura_plugin/Cargo.toml
+          python3 scripts/apply_training_anim_skip.py
+          FIRST=$(sha256sum hachimi_ura_plugin/src/lib.rs | cut -d' ' -f1)
+          python3 scripts/apply_training_anim_skip.py
+          SECOND=$(sha256sum hachimi_ura_plugin/src/lib.rs | cut -d' ' -f1)
+          test "$FIRST" = "$SECOND"
+          grep -Fq 'mod training_anim_skip;' hachimi_ura_plugin/src/lib.rs
+          grep -Fq '"/api/training/anim_skip"' hachimi_ura_plugin/src/lib.rs
+
+      - name: Setup Rust
+        run: rustup target add aarch64-linux-android
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26c
+          link-to-sdk: true
+
+      - name: Build Android arm64 SO
+        working-directory: hachimi_ura_plugin
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          CC_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          CXX_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
+          AR_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          HLPATCH_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          cargo build --locked --target aarch64-linux-android --release 2>&1 | tee anim-skip-cargo.log
+
+      - name: Manifest
+        run: |
+          set -euo pipefail
+          ASSET=hachimi_ura_plugin/target/aarch64-linux-android/release/libhachimi_ura.so
+          test -s "$ASSET"
+          SHA256=$(sha256sum "$ASSET" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$ASSET")
+          printf '%s  %s\n' "$SHA256" libhachimi_ura.so > SHA256SUMS
+          cat > BUILD-MANIFEST.txt <<EOF
+          source_commit=${GITHUB_SHA}
+          binary_size=$SIZE
+          binary_sha256=$SHA256
+          workflow_run=${GITHUB_RUN_ID}
+          feature=training_anim_skip
+          endpoint_status=/api/training/anim_skip
+          endpoint_enable=/api/training/anim_skip/on
+          endpoint_disable=/api/training/anim_skip/off
+          runtime_validation=pending_device_execution
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libhachimi_ura-training-anim-skip-${{ github.sha }}
+          path: |
+            hachimi_ura_plugin/target/aarch64-linux-android/release/libhachimi_ura.so
+            hachimi_ura_plugin/anim-skip-cargo.log
+            SHA256SUMS
+            BUILD-MANIFEST.txt
+          if-no-files-found: error
+
+----------------------------------------------------------------
+1.4b v3.28.1 正式发布流水线：
+     .github/workflows/release-v3281-training-anim-skip.yml
+作用：干净检出 -> 依次贴补丁 -> 编译 -> 版本号断言 -> 打 tag ->
+     发 Release（.so + SHA256SUMS + BUILD-MANIFEST.txt + 编译日志）。
+----------------------------------------------------------------
+name: Release v3.28.1 Training Anim Skip + Version Single Source
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/release-v3281-training-anim-skip.yml
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Generate and validate baseline 3.27.23
+        run: |
+          set -euo pipefail
+          python3 scripts/run_generated_succession_l_cumulative.py
+          python3 scripts/bump_plugin_version.py 3.27.23
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' hachimi_ura_plugin/Cargo.toml | head -1)" = "3.27.23"
+          grep -Fq 'version = "3.27.23"' hachimi_ura_plugin/Cargo.lock
+          grep -Fq 'verified_ramen_upstream_semantics' hachimi_ura_plugin/src/lib.rs
+      - name: Add SIGSEGV guard — rename first, then insert wrappers
+        run: |
+          set -euo pipefail
+          apply_guard() {
+            python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('hachimi_ura_plugin/src/lib.rs')
+          text = source.read_text(encoding='utf-8')
+          MARK = 'v3.27.23 sigsegv-guard'
+
+          if 'fn hl_ptr_mapped(' in text:
+              print('sigsegv_guard=already_applied')
+              raise SystemExit(0)
+
+          # v3 顺序：先改名，再插块。
+          # （v2 教训：先插块会让 rename 锚点同时命中包装函数定义 → count=2）
+          # 只锚函数签名行，不碰任何函数体（生成器函数体会漂移）。
+
+          # ── 1) 原函数改名 _inner（此时文件里签名行必然唯一，count==1 断言）──
+          renames = [
+              ('unsafe fn read_obscured_int_at(obj: *const c_void, field_offset: i32) -> i32 {',
+               'unsafe fn read_obscured_int_at_inner(obj: *const c_void, field_offset: i32) -> i32 {'),
+              ('unsafe fn read_ptr_at(obj: *const c_void, field_offset: i32) -> *mut c_void {',
+               'unsafe fn read_ptr_at_inner(obj: *const c_void, field_offset: i32) -> *mut c_void {'),
+              ('unsafe fn read_int_at(obj: *const c_void, field_offset: i32) -> i32 {',
+               'unsafe fn read_int_at_inner(obj: *const c_void, field_offset: i32) -> i32 {'),
+          ]
+          for old, new in renames:
+              c = text.count(old)
+              if c != 1:
+                  raise RuntimeError(f'rename anchor count={c} (expect 1): {old[:60]}')
+              text = text.replace(old, new, 1)
+
+          # ── 2) helpers + 同名包装插在 read_obscured_int_at_inner 定义之前 ──
+          anchor = 'unsafe fn read_obscured_int_at_inner(obj: *const c_void, field_offset: i32) -> i32 {'
+          if text.count(anchor) != 1:
+              raise RuntimeError(f'insert anchor count={text.count(anchor)} (expect 1)')
+
+          block = '''// v3.27.23 sigsegv-guard: mapped-region validation for raw memory reads.
+          // Root cause: read_summary dereferenced game objects already freed on
+          // screen change (scenario/data-set swap), raising SIGSEGV -> 60s
+          // recovery cooldown with empty trainings/ramen output. Any address
+          // outside a currently-readable mapping is now read as null / -1.
+          // Maps snapshot cached 2s; unreadable maps fail OPEN (never brick reads).
+          // Original helpers renamed *_inner; same-name wrappers add the guard
+          // without assuming anything about the original bodies.
+          static HL_MAP_CACHE: std::sync::Mutex<Option<(u64, Vec<(usize, usize)>)>> =
+              std::sync::Mutex::new(None);
+
+          fn hl_parse_maps_readable() -> Vec<(usize, usize)> {
+              let text = match std::fs::read_to_string("/proc/self/maps") {
+                  Ok(t) => t,
+                  Err(_) => return Vec::new(),
+              };
+              let mut out: Vec<(usize, usize)> = Vec::new();
+              for line in text.lines() {
+                  let range = match line.split_whitespace().next() {
+                      Some(r) => r,
+                      None => continue,
+                  };
+                  let perms = line.split_whitespace().nth(1).unwrap_or("");
+                  if !perms.starts_with('r') {
+                      continue;
+                  }
+                  let mut it = range.splitn(2, '-');
+                  let s = match it.next() { Some(v) => v, None => continue };
+                  let e = match it.next() { Some(v) => v, None => continue };
+                  let s = usize::from_str_radix(s, 16).unwrap_or(0);
+                  let e = usize::from_str_radix(e, 16).unwrap_or(0);
+                  if e > s {
+                      out.push((s, e));
+                  }
+              }
+              out
+          }
+
+          fn hl_ptr_mapped(addr: usize) -> bool {
+              if addr == 0 {
+                  return false;
+              }
+              let now = std::time::SystemTime::now()
+                  .duration_since(std::time::UNIX_EPOCH)
+                  .map(|d| d.as_secs())
+                  .unwrap_or(0);
+              let mut cache = match HL_MAP_CACHE.lock() {
+                  Ok(g) => g,
+                  Err(poisoned) => poisoned.into_inner(),
+              };
+              let stale = match *cache {
+                  Some((ts, _)) => now.saturating_sub(ts) >= 2,
+                  None => true,
+              };
+              if stale {
+                  *cache = Some((now, hl_parse_maps_readable()));
+              }
+              let regions = match cache.as_ref() {
+                  Some((_, r)) => r,
+                  None => return true,
+              };
+              if regions.is_empty() {
+                  return true; // maps unreadable — fail open
+              }
+              let mut lo = 0usize;
+              let mut hi = regions.len();
+              while lo < hi {
+                  let mid = (lo + hi) / 2;
+                  let (s, e) = regions[mid];
+                  if addr < s {
+                      hi = mid;
+                  } else if addr >= e {
+                      lo = mid + 1;
+                  } else {
+                      return true;
+                  }
+              }
+              false
+          }
+
+          // v3.27.23 sigsegv-guard wrapper: unmapped holder or returned pointer -> null
+          unsafe fn read_ptr_at(obj: *const c_void, field_offset: i32) -> *mut c_void {
+              if !hl_ptr_mapped(obj as usize) {
+                  return std::ptr::null_mut();
+              }
+              let value = read_ptr_at_inner(obj, field_offset);
+              if !value.is_null() && !hl_ptr_mapped(value as usize) {
+                  return std::ptr::null_mut(); // freed/dangling pointer read as null
+              }
+              value
+          }
+
+          // v3.27.23 sigsegv-guard wrapper: unmapped holder -> -1
+          unsafe fn read_obscured_int_at(obj: *const c_void, field_offset: i32) -> i32 {
+              if !hl_ptr_mapped(obj as usize) {
+                  return -1;
+              }
+              read_obscured_int_at_inner(obj, field_offset)
+          }
+
+          // v3.27.23 sigsegv-guard wrapper: unmapped holder -> -1
+          unsafe fn read_int_at(obj: *const c_void, field_offset: i32) -> i32 {
+              if !hl_ptr_mapped(obj as usize) {
+                  return -1;
+              }
+              read_int_at_inner(obj, field_offset)
+          }
+
+          '''
+          text = text.replace(anchor, block + anchor, 1)
+
+          source.write_text(text, encoding='utf-8')
+          print('sigsegv_guard=applied marker_count=%d' % text.count(MARK))
+          PY
+          }
+          apply_guard
+          FIRST_SHA=$(sha256sum hachimi_ura_plugin/src/lib.rs | cut -d' ' -f1)
+          apply_guard
+          SECOND_SHA=$(sha256sum hachimi_ura_plugin/src/lib.rs | cut -d' ' -f1)
+          test "$FIRST_SHA" = "$SECOND_SHA"
+
+      - name: Apply screen mirror A-stage (v3.28.0)
+        run: |
+          set -euo pipefail
+          python3 scripts/apply_screen_mirror_frame_a.py
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' hachimi_ura_plugin/Cargo.toml | head -1)" = "3.28.0"
+          grep -Fq '// ===== Screen mirror frame A-stage (v3.28.0) =====' hachimi_ura_plugin/src/lib.rs
+          grep -Fq 'mirror_egl_swap_handler' hachimi_ura_plugin/src/lib.rs
+          grep -Fq '"/api/frame"' hachimi_ura_plugin/src/lib.rs
+          grep -Fq '"/api/touch"' hachimi_ura_plugin/src/lib.rs
+          grep -Fq 'install_screen_mirror_hook' hachimi_ura_plugin/src/lib.rs
+      - name: Qualification greps (mirror invariants)
+        run: |
+          set -euo pipefail
+          for s in \
+            'MIRROR_FRAME: Mutex<Option<Vec<u8>>>' \
+            'MIRROR_TOUCHES: Mutex<Vec<(u64, f32, f32)>>' \
+            'glReadPixels' \
+            'X-Frame-Seq' \
+            'mirror_egl_swap_handler' \
+            'install_screen_mirror_hook'
+          do grep -aFq "$s" hachimi_ura_plugin/src/lib.rs || { echo "MISSING INVARIANT: $s"; exit 1; }
+          done
+      - name: Setup Rust
+        run: rustup target add aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26c
+          link-to-sdk: true
+      - name: Bump to 3.28.1 and apply feature patches (signup + anim-skip + dynamic version)
+        run: |
+          set -euo pipefail
+          python3 scripts/bump_plugin_version.py 3.28.1
+          python3 scripts/apply_signup_plaintext_observer.py
+          python3 scripts/apply_training_anim_skip.py
+          FIRST=$(sha256sum hachimi_ura_plugin/src/lib.rs | cut -d' ' -f1)
+          python3 scripts/apply_training_anim_skip.py
+          SECOND=$(sha256sum hachimi_ura_plugin/src/lib.rs | cut -d' ' -f1)
+          test "$FIRST" = "$SECOND"
+          python3 scripts/apply_dynamic_version.py
+          grep -Fq 'mod training_anim_skip;' hachimi_ura_plugin/src/lib.rs
+          grep -Fq '"/api/training/anim_skip"' hachimi_ura_plugin/src/lib.rs
+          grep -Fq 'mod signup_plaintext;' hachimi_ura_plugin/src/lib.rs
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' hachimi_ura_plugin/Cargo.toml | head -1)" = "3.28.1"
+      - name: Build Android arm64 release
+        id: cargo
+        working-directory: hachimi_ura_plugin
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          CC_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          CXX_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
+          AR_aarch64_linux_android: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+        run: set -o pipefail; cargo build --target aarch64-linux-android --release 2>&1 | tee release-v3281-cargo.log
+      - name: Prepare immutable release assets
+        run: |
+          set -euo pipefail
+          ASSET=hachimi_ura_plugin/target/aarch64-linux-android/release/libhachimi_ura.so
+          test -s "$ASSET"
+          SHA256=$(sha256sum "$ASSET" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$ASSET")
+          printf '%s  %s\n' "$SHA256" libhachimi_ura.so > SHA256SUMS
+          cat > BUILD-MANIFEST.txt <<EOF
+          source_commit=${GITHUB_SHA}
+          cargo_version=3.28.1
+          binary_size=$SIZE
+          binary_sha256=$SHA256
+          tag=v3.28.1
+          workflow_run=${GITHUB_RUN_ID}
+          baseline=v3.28.0(screen_mirror_frame_a+sigsegv_guard)
+          features=training_anim_skip,version_single_source,signup_plaintext_observer,screen_mirror_frame_a,sigsegv_guard
+          runtime_validation=pending_device_execution
+          EOF
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSET=hachimi_ura_plugin/target/aarch64-linux-android/release/libhachimi_ura.so
+          gh release create "v3.28.1" "$ASSET" SHA256SUMS BUILD-MANIFEST.txt hachimi_ura_plugin/release-v3281-cargo.log \
+            --title "v3.28.1 训练动画跳过 + 版本号单源化" \
+            --notes "基线=v3.28.0。新增：①训练动画跳过——AI选定训练后自动跳过育成演出动画（钩训练演出Init、调游戏自带SkipRuntime），/api/training/anim_skip、/on、/off 三端点可查可开关，游戏未初始化完也能用；②版本号单源化——此前用Agora查询会看到旧版本号（21处端点硬编码3.22.91），现在插件上报版本与发布版本一致（3.28.1），加载日志同步动态；③补上签名明文观测端点（signup plaintext）。SHA256见SHA256SUMS。"
+
+################################################################
+【仓库二】xf8410/umaai-rs-fanfix —— 育成模拟器"反摆烂"权重线
+说明：这个仓库是上游模拟器的自有分叉，专门修"手写策略评分权重"。
+每修一个候选病根就做成一条"臂"，放进 bench 里和基线 A 同种子对打，
+赢了转正、输了留档。全部改动默认关闭（权重=0），不影响基线行为。
+基线分：A = 64271.5。长期目标：76000。
+################################################################
+
+----------------------------------------------------------------
+2.1 补丁 0008（已留档）：溢出回合诀窍槽产出计价
+分支：workbench/bailan-feelprice 提交 d7f2f4e
+结果：A/B 判负（-9.1 分，无信号）——教训：计价项不是瓶颈就测不出信号。
+以下为完整补丁内容（git diff 原文）：
+----------------------------------------------------------------
+diff --git a/crates/umasim/src/game/ramen/policy.rs b/crates/umasim/src/game/ramen/policy.rs
+index 4917fc9..b93b834 100644
+--- a/crates/umasim/src/game/ramen/policy.rs
++++ b/crates/umasim/src/game/ramen/policy.rs
+@@ -23,7 +23,8 @@ use crate::{
+     game::{
+         ramen::{Operation, RamenAction, RamenGame},
+         traits::Game,
+-        CardTrainingEffect
++        CardTrainingEffect,
++        PersonType
+     },
+     gamedata::{ActionValue, EventChoice, FreeRaceData, GAMECONSTANTS, ramen::RAMENDATA},
+     global,
+@@ -162,7 +163,13 @@ pub struct RamenPolicyConfig {
+     /// 事件干劲每点折算
+     pub event_motivation_weight: f32,
+     /// 事件获得 bad flag（ill/bad_trainer）的惩罚
+-    pub event_bad_flag_penalty: f32
++    pub event_bad_flag_penalty: f32,
++    /// 溢出诀窍槽计价（fanfix 0009，反摆烂 v1）：主位已满（cap_left=0）的训练回合，
++    /// 属性差分被截断后打分层只剩 PT——但训练的诀窍槽产出（→诀窍→面经济）照常记账，
++    /// 从未计价，AI 误判「练了白练」而摆烂（溢出属性训练摆烂，小黑板已知问题）。
++    /// 本项计价 `weight × 期望槽增量 / GAUGE_LIMIT(7)` ≈ 期望诀窍数 × 权重；非溢出回合恒 0。
++    /// `0.0`（默认）= 关闭，逐位不变。量级与 `region_xunlian_weight` 同族（扫描定，初始 20-40）。
++    pub overflow_feeling_weight: f32
+ }
+ 
+ impl Default for RamenPolicyConfig {
+@@ -199,7 +206,8 @@ impl Default for RamenPolicyConfig {
+             region_weak_cover_weight: 0.0,
+             event_vital_weight: 2.2,
+             event_motivation_weight: 40.0,
+-            event_bad_flag_penalty: 300.0
++            event_bad_flag_penalty: 300.0,
++            overflow_feeling_weight: 0.0
+         }
+     }
+ }
+@@ -814,9 +822,31 @@ impl RamenPolicy {
+         // 体力成本（消耗按 train_vital_value 折算）
+         let vital_cost = (-value.vital).max(0) as f32 * self.config.train_vital_value;
+         let shining = eval.shining as f32 * self.config.shining_bonus;
++        // 溢出诀窍槽计价（fanfix 0009，反摆烂 v1）：主位已满（cap_left=0）时，训练的属性
++        // 差分被截断，但诀窍槽产出照常发生（基础分布 + 角标加成 + 友情各槽+2）却从未计价，
++        // AI 因此误判「练了白练」而摆烂（溢出属性训练摆烂，小黑板已知问题）。
++        // 输入口径与 fill_feeling_gauge 完全一致；夏合宿全 MAX 回合稀少，v1 不单列。
++        let feel = if self.config.overflow_feeling_weight > 0.0 && cap_left == 0 {
++            let support_count = game.distribution[train]
++                .iter()
++                .filter(|&&p| p >= 0 && game.persons[p as usize].person_type == PersonType::Card)
++                .count();
++            let npc_count = game.distribution[train]
++                .iter()
++                .filter(|&&p| p >= 0 && game.persons[p as usize].person_type == PersonType::Npc)
++                .count();
++            let train_bonus = super::rules::calc_train_feeling_bonus(support_count, npc_count);
++            let base_total: i32 =
++                super::rules::calc_gauge_base_distribution(&game.ramen.selected_regions).iter().sum();
++            let shine_add = if eval.shining > 0 { 6 } else { 0 }; // 友情训练三槽各 +2
++            let slot_inc = (base_total + train_bonus + shine_add).max(0) as f32;
++            self.config.overflow_feeling_weight * slot_inc / super::rules::GAUGE_LIMIT as f32
++        } else {
++            0.0
++        };
+         // 失败的期望损失：成功时才有的收益 × 失败率 + 固定失败惩罚 × 失败率
+         let fail_p = fail_rate / 100.0;
+-        let gross = attr + pt - vital_cost + shining;
++        let gross = attr + pt - vital_cost + shining + feel;
+         let fail_adj = -(gross * fail_p + self.config.failure_penalty * fail_p);
+         out.score = gross + fail_adj;
+         out.train_fail_adj = fail_adj;
+@@ -827,6 +857,7 @@ impl RamenPolicy {
+             out.add("vital_cost", -vital_cost);
+             out.add("shining", shining);
+             out.add("fail_adj", fail_adj);
++            out.add("overflow_feeling", feel);
+             out.reason = format!(
+                 "{}训练 失败率{fail_rate:.0}% 属性+{attr_gain:.0} PT+{pt_gain:.0}",
+                 global!(GAMECONSTANTS).train_names[train]
+diff --git a/crates/umasim/src/trainer/local_ramen_trainer.rs b/crates/umasim/src/trainer/local_ramen_trainer.rs
+index 1edcfda..5568016 100644
+--- a/crates/umasim/src/trainer/local_ramen_trainer.rs
++++ b/crates/umasim/src/trainer/local_ramen_trainer.rs
+@@ -1772,6 +1772,12 @@ impl RecommendedRamenTrainer {
+                 trainer.years[1].config.power_overflow_strength = v.parse::<f32>()? / 100.0;
+             } else if let Some(v) = token.strip_prefix("p3o") {
+                 trainer.years[2].config.power_overflow_strength = v.parse::<f32>()? / 100.0;
++            } else if let Some(v) = token.strip_prefix("feel") {
++                // 溢出诀窍槽计价（fanfix 0009，反摆烂 v1）：feel30 → weight=30.0，全年生效。
++                let w: f32 = v.parse()?;
++                for year in trainer.years.iter_mut() {
++                    year.policy.config.overflow_feeling_weight = w;
++                }
+             } else if let Some(v) = token.strip_prefix("pg") {
+                 // EXP-006e：power 短板追赶覆盖。负值用 'm' 前缀编码（'-' 是 token
+                 // 分隔符）：pgm30 → −0.30，pg30 → +0.30。
+diff --git a/crates/umasim/tests/overflow_slack_bench.rs b/crates/umasim/tests/overflow_slack_bench.rs
+index 590a8da..c647864 100644
+--- a/crates/umasim/tests/overflow_slack_bench.rs
++++ b/crates/umasim/tests/overflow_slack_bench.rs
+@@ -61,7 +61,7 @@ fn overflow_slack_bench_ab() -> Result<(), Box<dyn std::error::Error>> {
+         extra_count: [10, 10, 20, 20, 20, 40],
+     };
+ 
+-    let arm_defs: [(&str, &str); 9] = [
++    let arm_defs: [(&str, &str); 12] = [
+         ("A-preset(转正)", "base"),
+         ("B-rclamp", "rclamp"),
+         ("C-vcurve", "vcurve"),
+@@ -71,6 +71,9 @@ fn overflow_slack_bench_ab() -> Result<(), Box<dyn std::error::Error>> {
+         ("G-capf25", "capf25"),
+         ("H-restdamp", "restdamp"),
+         ("I-slack20", "slack20"),
++        ("J-feelprice30", "feel30"),
++        ("K-slack40", "slack40"),
++        ("L-slack60", "slack60"),
+     ];
+     let mut aggs: Vec<(&str, Agg)> = arm_defs.iter().map(|(n, _)| (*n, Agg::default())).collect();
+     let mut skipped: Vec<&str> = Vec::new();
+
+----------------------------------------------------------------
+2.2 补丁 0010（已留档，机制默认关）：训练回体力计价
+分支：workbench/handpolicy-recovery-price-20260913 提交 c69eb122
+病根：训练公式里体力项只算"消耗"，训练回血的 +5 体力被 .max(0)
+     直接扔掉、完全不计价 -> 智慧训练被系统性低估。
+修法：给每点正回体配影子价 1.8（和体力消耗侧同价、低于休息价 2.5）。
+结果：A/B 判负——M-recv18 = 64142.4（-129.1），N-recv9 = 64188.5（-83.0），
+     剂量越大亏越多，留档不上车。
+以下为完整补丁内容（git diff 原文）：
+----------------------------------------------------------------
+diff --git a/crates/umasim/src/game/ramen/policy.rs b/crates/umasim/src/game/ramen/policy.rs
+index b93b834..653a0c8 100644
+--- a/crates/umasim/src/game/ramen/policy.rs
++++ b/crates/umasim/src/game/ramen/policy.rs
+@@ -169,7 +169,20 @@ pub struct RamenPolicyConfig {
+     /// 从未计价，AI 误判「练了白练」而摆烂（溢出属性训练摆烂，小黑板已知问题）。
+     /// 本项计价 `weight × 期望槽增量 / GAUGE_LIMIT(7)` ≈ 期望诀窍数 × 权重；非溢出回合恒 0。
+     /// `0.0`（默认）= 关闭，逐位不变。量级与 `region_xunlian_weight` 同族（扫描定，初始 20-40）。
+-    pub overflow_feeling_weight: f32
++    pub overflow_feeling_weight: f32,
++    /// 训练回体力计价（fanfix 0010，反摆烂 v2）：每点「训练正回体」计入训练毛分的影子价。
++    /// 默认 `0.0` = 不计价，逐位保留旧行为。
++    ///
++    /// 依据（结算层事实，非脑补）：
++    /// - 结算口径：`ActionValue.vital` 为正表示该训练回复体力（智慧训练 +5，
++    ///   由训练面结算 `default_calc_training_value` 产出）。训练分公式的体力项历来
++    ///   只计消耗 `(-value.vital).max(0) * train_vital_value`，正回体被 `.max(0)`
++    ///   丢弃、完全无价（见 docs/source-valuation-report.md §3「训练回体力 不计值」）。
++    /// - 影子价取值 1.8：与同公式消耗侧 `train_vital_value`（默认 1.8）对称——同一体力
++    ///   账户的收入与支出用同一影子价，零新增魔法数字；且必须 ≤ 专职恢复动作的定价
++    ///   `rest_vital_value`（默认 2.5），否则训练回体会被高估到超过休息本身。
++    /// - 计价含于 `gross`：与属性/PT 同样接受失败率期望折扣（回体仅成功时到手）。
++    pub train_recovery_value: f32
+ }
+ 
+ impl Default for RamenPolicyConfig {
+@@ -207,7 +220,9 @@ impl Default for RamenPolicyConfig {
+             event_vital_weight: 2.2,
+             event_motivation_weight: 40.0,
+             event_bad_flag_penalty: 300.0,
+-            overflow_feeling_weight: 0.0
++            overflow_feeling_weight: 0.0,
++            // 训练回体计价（fanfix 0010）：默认关，基准实验后定去留（权重依据见字段注释）。
++            train_recovery_value: 0.0
+         }
+     }
+ }
+@@ -846,7 +861,13 @@ impl RamenPolicy {
+         };
+         // 失败的期望损失：成功时才有的收益 × 失败率 + 固定失败惩罚 × 失败率
+         let fail_p = fail_rate / 100.0;
+-        let gross = attr + pt - vital_cost + shining + feel;
++        // 训练回体力计价（fanfix 0010，反摆烂 v2）：结算层智慧等槽位带正回体（如+5），
++        // 原公式只计消耗 (-value.vital).max(0)，回体无价（source-valuation-report §3）。
++        // 口径 = ActionValue.vital 正部（与消耗侧同一字段同一口径）× 影子价；
++        // 计入 gross 故与属性/PT 同样接受失败率折扣。权重来源与上界见
++        // RamenPolicyConfig::train_recovery_value 字段注释。
++        let vital_recovery = value.vital.max(0) as f32 * self.config.train_recovery_value;
++        let gross = attr + pt - vital_cost + shining + feel + vital_recovery;
+         let fail_adj = -(gross * fail_p + self.config.failure_penalty * fail_p);
+         out.score = gross + fail_adj;
+         out.train_fail_adj = fail_adj;
+@@ -858,6 +879,9 @@ impl RamenPolicy {
+             out.add("shining", shining);
+             out.add("fail_adj", fail_adj);
+             out.add("overflow_feeling", feel);
++            if vital_recovery != 0.0 {
++                out.add("train_recovery", vital_recovery);
++            }
+             out.reason = format!(
+                 "{}训练 失败率{fail_rate:.0}% 属性+{attr_gain:.0} PT+{pt_gain:.0}",
+                 global!(GAMECONSTANTS).train_names[train]
+diff --git a/crates/umasim/src/trainer/local_ramen_trainer.rs b/crates/umasim/src/trainer/local_ramen_trainer.rs
+index 5568016..94308ec 100644
+--- a/crates/umasim/src/trainer/local_ramen_trainer.rs
++++ b/crates/umasim/src/trainer/local_ramen_trainer.rs
+@@ -1778,6 +1778,15 @@ impl RecommendedRamenTrainer {
+                 for year in trainer.years.iter_mut() {
+                     year.policy.config.overflow_feeling_weight = w;
+                 }
++            } else if let Some(v) = token.strip_prefix("recv") {
++                // 训练回体计价（fanfix 0010，反摆烂 v2）：recv18 → train_recovery_value=1.8。
++                // 读数规则与 feel 族一致（整数÷10）。权重依据见
++                // RamenPolicyConfig::train_recovery_value 字段注释：与体力消耗影子价
++                // 1.8 对称、低于专职恢复的休息价 2.5，非魔法数字。
++                let w: f32 = v.parse::<f32>()? / 10.0;
++                for year in trainer.years.iter_mut() {
++                    year.policy.config.train_recovery_value = w;
++                }
+             } else if let Some(v) = token.strip_prefix("pg") {
+                 // EXP-006e：power 短板追赶覆盖。负值用 'm' 前缀编码（'-' 是 token
+                 // 分隔符）：pgm30 → −0.30，pg30 → +0.30。
+diff --git a/crates/umasim/tests/overflow_slack_bench.rs b/crates/umasim/tests/overflow_slack_bench.rs
+index c647864..8fc2dc5 100644
+--- a/crates/umasim/tests/overflow_slack_bench.rs
++++ b/crates/umasim/tests/overflow_slack_bench.rs
+@@ -8,6 +8,9 @@
+ //! 臂 G = capf25（0006：满位副属性折扣下限 0.25——收益侧零化修复）
+ //! 臂 H = restdamp（0007：休息价值分年折扣 [1.0,0.9,0.6,0.3]——恢复侧定价）
+ //! 臂 I = slack20（0008：status_gain 上限期权计价 +20——选择层有界前瞻）
++//! 臂 M = recv18（fanfix 0010：训练正回体计价 1.8/点——无价收益通道补账，
++//! 口径=ActionValue.vital 正部×影子价；权重=消耗侧 train_vital_value 对称值）
++//! 臂 N = recv9（0010 半剂量敏感性：0.9/点，验证剂量-响应）
+ //! 计量：train/game、rests/game（守门标/anon/打分）、自选比赛、终局分。
+ //! 判读（一次一变量，各自独立对 A）：见 docs/bench-v10-hypotheses.md 的否决线；
+ //! 任何新臂终局分劣于 A 超过噪声带（≈0.15%）即判负留档，不进组合臂。
+@@ -47,6 +50,7 @@ struct Agg {
+     rest_gate_anon: usize,
+     rest_scoring: usize,
+     train_turns: usize,
++    wisdom_picks: usize,
+ }
+ 
+ #[test]
+@@ -61,7 +65,7 @@ fn overflow_slack_bench_ab() -> Result<(), Box<dyn std::error::Error>> {
+         extra_count: [10, 10, 20, 20, 20, 40],
+     };
+ 
+-    let arm_defs: [(&str, &str); 12] = [
++    let arm_defs: [(&str, &str); 14] = [
+         ("A-preset(转正)", "base"),
+         ("B-rclamp", "rclamp"),
+         ("C-vcurve", "vcurve"),
+@@ -74,6 +78,8 @@ fn overflow_slack_bench_ab() -> Result<(), Box<dyn std::error::Error>> {
+         ("J-feelprice30", "feel30"),
+         ("K-slack40", "slack40"),
+         ("L-slack60", "slack60"),
++        ("M-recv18", "recv18"),
++        ("N-recv9", "recv9"),
+     ];
+     let mut aggs: Vec<(&str, Agg)> = arm_defs.iter().map(|(n, _)| (*n, Agg::default())).collect();
+     let mut skipped: Vec<&str> = Vec::new();
+@@ -117,6 +123,9 @@ fn overflow_slack_bench_ab() -> Result<(), Box<dyn std::error::Error>> {
+                         }
+                     } else if row.action_desc.contains("训练") {
+                         a.train_turns += 1;
++                        if row.action_desc.contains("智") {
++                            a.wisdom_picks += 1;
++                        }
+                     } else if row.action_desc.contains("休息") {
+                         let bd = row.score_breakdown.clone().unwrap_or_default();
+                         if bd.contains("守门") {
+@@ -148,14 +157,15 @@ fn overflow_slack_bench_ab() -> Result<(), Box<dyn std::error::Error>> {
+         }
+         let g = a.games as f64;
+         println!(
+-            "{name}: mean_score={:.1} | train/game={:.2} rests/game={:.2}(守门 {:.2}+打分 {:.2}+anon {:.2}) | 自选比赛/game={:.2}",
++            "{name}: mean_score={:.1} | train/game={:.2} rests/game={:.2}(守门 {:.2}+打分 {:.2}+anon {:.2}) | 自选比赛/game={:.2} | 智训率={:.1}%",
+             a.score / g,
+             a.train_turns as f64 / g,
+             (a.rest_gate_marked + a.rest_gate_anon + a.rest_scoring) as f64 / g,
+             a.rest_gate_marked as f64 / g,
+             a.rest_scoring as f64 / g,
+             a.rest_gate_anon as f64 / g,
+-            a.race_free as f64 / g
++            a.race_free as f64 / g,
++            if a.train_turns > 0 { a.wisdom_picks as f64 / a.train_turns as f64 * 100.0 } else { 0.0 }
+         );
+     }
+     Ok(())
+
+################################################################
+【工具】溢出摆烂局面捕获器（本地分析工具，不进仓库）
+位置：audit/_work/overflow_capture/wrapper/
+说明：用上游手写策略 headless 跑 900 局，三个触发器自动捕获可疑局面，
+     并对每个局面做"强制走子反判"（如果当时换一步走会怎样）。
+     正是它给出了定稿结论：溢出不点智力其实是合理取舍
+     （反判平均亏 692 分）。
+################################################################
+
+----------------------------------------------------------------
+3.1 捕获器主程序（约 766 行）
+文件：wrapper/src/main.rs
+----------------------------------------------------------------
+（注：源文件所在云盘今日 I/O 故障，暂时读不出，待恢复后补录本节。
+工具的功能与结论已在《进度交接报告》3.2 节完整说明；
+数据在 audit/agora_hlpatch_evidence/overflow_capture_20260913/。）
+
+====================================================================
+（完）以上为全部代码。补丁与工作流的最新原件以 GitHub 仓库为准：
+  - hlpatch：xf8410/hlpatch（main@a86707e）
+  - 反摆烂：xf8410/umaai-rs-fanfix（分支见各节说明）
+====================================================================
