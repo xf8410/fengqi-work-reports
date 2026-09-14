@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>v40 复跑三块对比报告</title>
+<style>
+:root{
+  --ink:#1c2330; --sub:#5a6577; --line:#e3e7ee; --bg:#ffffff; --soft:#f5f7fa;
+  --pos:#0a7d33; --pos-bg:#e8f5ec; --neg:#c0392b; --neg-bg:#fdecea;
+  --acc:#0b5cad; --acc-bg:#e8f1fa; --warn:#b26a00; --warn-bg:#fff4e0;
+}
+*{box-sizing:border-box; margin:0; padding:0}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--ink); line-height:1.6; padding:16px 14px 48px; max-width:960px; margin:0 auto}
+h1{font-size:1.35rem; line-height:1.35; margin-bottom:4px}
+h2{font-size:1.08rem; margin:28px 0 10px; padding-left:10px; border-left:4px solid var(--acc)}
+.meta{color:var(--sub); font-size:.82rem; margin-bottom:18px}
+.lead{font-size:.95rem; margin-bottom:16px}
+.cards{display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin:14px 0}
+.card{background:var(--soft); border:1px solid var(--line); border-radius:10px; padding:12px 14px}
+.card .num{font-size:1.6rem; font-weight:700}
+.card .lbl{font-size:.78rem; color:var(--sub)}
+.card .note{font-size:.75rem; color:var(--sub); margin-top:2px}
+.c-red{color:var(--neg)} .c-green{color:var(--pos)} .c-blue{color:var(--acc)}
+.scroll{overflow-x:auto; border:1px solid var(--line); border-radius:10px; margin:10px 0; -webkit-overflow-scrolling:touch}
+table{border-collapse:collapse; font-size:.8rem; min-width:640px; width:100%}
+th,td{padding:7px 9px; text-align:right; border-bottom:1px solid var(--line); white-space:nowrap}
+th{background:var(--soft); color:var(--sub); font-weight:600; position:sticky; top:0}
+td:first-child,th:first-child{text-align:left; position:sticky; left:0; background:var(--bg); font-weight:600}
+th:first-child{background:var(--soft)}
+tr:last-child td{border-bottom:none}
+tr.base td{background:var(--acc-bg)}
+.dpos{color:var(--pos); font-weight:600}
+.dneg{color:var(--neg); font-weight:600}
+.badge{display:inline-block; padding:1px 8px; border-radius:10px; font-size:.72rem; font-weight:600}
+.b-ok{background:var(--pos-bg); color:var(--pos)}
+.b-no{background:#eef0f4; color:var(--sub)}
+.b-mid{background:var(--warn-bg); color:var(--warn)}
+.callout{border:1px solid var(--line); border-left:4px solid var(--acc); border-radius:8px; background:var(--soft); padding:10px 14px; font-size:.86rem; margin:12px 0}
+.callout.warn{border-left-color:var(--warn)}
+.callout.ok{border-left-color:var(--pos)}
+ul{padding-left:20px; font-size:.9rem}
+li{margin:5px 0}
+.note{font-size:.78rem; color:var(--sub); margin:6px 0 0}
+ol{padding-left:20px; font-size:.9rem}
+@media print{
+  body{padding:0; max-width:none}
+  .scroll{overflow:visible}
+  table{min-width:auto; font-size:.7rem}
+}
+</style>
+</head>
+<body>
+
+<h1>v40 复跑三块对比报告</h1>
+<p class="meta">2026-09-14 夜间自动复跑 · 12 变体 × 300 局 × 2 个新种子块（77701 / 88802）+ 原跑块（61444）汇总口径 · 共 7200 局复跑实测</p>
+
+<p class="lead">目的：检验 v40 原跑「PT 微降一票否决」淘汰 9 个变体（含 strong 系）是真实差异还是噪声。方法：换两个新种子块在完全相同代码（e07d802）上复跑全部矩阵，再做逐局 CRN 配对 t 检验。</p>
+
+<div class="cards">
+  <div class="card"><div class="num">3 / 0 / 10</div><div class="lbl">晋级名单（61444 / 77701 / 88802）</div><div class="note">同一套变体同一判据，种子块一换名单完全互斥</div></div>
+  <div class="card"><div class="num c-red">0 / 22</div><div class="lbl">CRN 配对检验过 95% 线数</div><div class="note">逐局配对后无任何变体能与对照区分开</div></div>
+  <div class="card"><div class="num c-green">+63.5</div><div class="lbl">strong 系三块均值 Δ分（最高且恒正）</div><div class="note">但属事后挑选，统计上只能算边缘信号</div></div>
+  <div class="card"><div class="num c-blue">+8200</div><div class="lbl">PhaseTrainer 碾压手写基线（t≈50）</div><div class="note">这个大盘结论从未被历史报告记录过</div></div>
+</div>
+
+<h2>结论（三句话版）</h2>
+<ol>
+  <li><strong>当前晋级判据在 300 局下没有分辨力</strong>：±40 分的配对标准误大于变体间真实差异（0~85 分），三块晋级名单 3→0→10 完全互斥是直接实证。原跑晋级 3 个变体属噪声晋级（在 77701 块全部翻车）。</li>
+  <li><strong>strong 系 9 个被否决的变体不是冤杀也不该直接召回</strong>：三块恒正（均值 +56~64、属性 +55~88）有信号倾向，但挑选偏差未校正，正确定谳是「边缘信号，需 n=900 高功效复跑拍板」。</li>
+  <li><strong>ΔPT 下降也是噪声</strong>：strong 系 ΔPT 三块符号翻转（−2.9 / −12.1 / −0.9），原跑「PT 微降一票否决」淘汰的核心理由不成立；判据真正的问题是四项硬 AND 没有噪声模型，还扔掉了逐局配对的方差缩减红利。</li>
+</ol>
+
+<h2>一、主表：12 变体三块 Δ分对比</h2>
+<p class="note">Δ = 变体平均分 − 各块对照 neutral-x-none 基线。均值 = 三块平均；「晋级」= 该块判据下是否晋级（✅/❌）。</p>
+<div class="scroll">
+<table>
+<thead><tr><th>变体</th><th>61444 原跑Δ</th><th>77701Δ</th><th>88802Δ</th><th>三块均值</th><th>88802 ΔPT</th><th>晋级 61444/77701/88802</th></tr></thead>
+<tbody>
+<tr><td>strong-x-overflow50</td><td class="dpos">+67.4</td><td class="dpos">+61.4</td><td class="dpos">+61.8</td><td class="dpos">+63.5</td><td class="dpos">+4.4</td><td>❌ ❌ ✅</td></tr>
+<tr><td>strong-x-none</td><td class="dpos">+67.6</td><td class="dpos">+52.3</td><td class="dpos">+67.2</td><td class="dpos">+62.4</td><td class="dpos">+3.8</td><td>❌ ❌ ✅</td></tr>
+<tr><td>strong-x-gap100-over75</td><td class="dpos">+83.2</td><td class="dpos">+63.2</td><td class="dpos">+22.8</td><td class="dpos">+56.4</td><td class="dneg">−0.9</td><td>❌ ❌ ❌</td></tr>
+<tr><td>medium-x-gap100-over75</td><td class="dpos">+73.8</td><td class="dneg">−6.9</td><td class="dpos">+65.5</td><td class="dpos">+44.1</td><td class="dpos">+4.9</td><td>✅ ❌ ✅</td></tr>
+<tr><td>mild-x-gap100-over75</td><td class="dpos">+78.6</td><td class="dneg">−1.2</td><td class="dpos">+36.3</td><td class="dpos">+37.9</td><td class="dpos">+2.9</td><td>✅ ❌ ✅</td></tr>
+<tr><td>medium-x-none</td><td class="dpos">+22.1</td><td class="dpos">+17.0</td><td class="dpos">+78.8</td><td class="dpos">+39.3</td><td class="dpos">+5.2</td><td>❌ ❌ ✅</td></tr>
+<tr><td>neutral-x-gap100-over75</td><td class="dpos">+54.8</td><td class="dneg">−29.7</td><td class="dpos">+73.1</td><td class="dpos">+32.7</td><td class="dpos">+5.4</td><td>✅ ❌ ✅</td></tr>
+<tr><td>medium-x-overflow50</td><td class="dpos">+12.4</td><td class="dneg">−5.3</td><td class="dpos">+84.7</td><td class="dpos">+30.6</td><td class="dpos">+6.4</td><td>❌ ❌ ✅</td></tr>
+<tr><td>mild-x-overflow50</td><td class="dpos">+19.7</td><td class="dneg">−14.8</td><td class="dpos">+63.0</td><td class="dpos">+22.6</td><td class="dpos">+5.1</td><td>❌ ❌ ✅</td></tr>
+<tr><td>neutral-x-overflow50</td><td class="dpos">+15.5</td><td class="dneg">−6.0</td><td class="dpos">+50.1</td><td class="dpos">+19.9</td><td class="dpos">+4.8</td><td>✅ ❌ ✅</td></tr>
+<tr><td>mild-x-none</td><td class="dneg">−1.3</td><td class="dpos">+0.3</td><td class="dpos">+31.6</td><td class="dpos">+10.2</td><td class="dpos">+0.9</td><td>❌ ❌ ✅</td></tr>
+<tr class="base"><td>neutral-x-none（对照）</td><td>58906.3</td><td>58934.8</td><td>58890.3</td><td>—</td><td>0.0</td><td>基线</td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout warn"><strong>怎么看这张表：</strong>没有一个变体在三块都保持正 Δ 的同时排名稳定——medium-x-overflow50 从 +12.4 摆到 −5.3 再跳 +84.7；neutral-x-gap100-over75 从 +54.8 掉到 −29.7。只有 strong 系三个（前两行+第三行）三块恒正。块间基线本身 ±45 分波动，与多数变体差异同阶——块内排名不可外推。</div>
+
+<h2>二、77701 块明细（run 34820746072，37/37 绿）</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>变体</th><th>平均分</th><th>Δ分</th><th>P10/P50/P90</th><th>ΔP10</th><th>平均PT</th><th>ΔPT</th><th>属性评分</th><th>Δ属性</th><th>五维和</th><th>晋级</th></tr></thead>
+<tbody>
+<tr><td>strong-x-gap100-over75</td><td>58998.0</td><td class="dpos">+63.2</td><td>55232/59071/62575</td><td class="dneg">−57</td><td>7782.6</td><td class="dneg">−12.1</td><td>40360.9</td><td class="dpos">+88.0</td><td>9505.2</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>strong-x-overflow50</td><td>58996.3</td><td class="dpos">+61.4</td><td>55398/59144/62603</td><td class="dpos">+109</td><td>7788.1</td><td class="dneg">−6.6</td><td>40344.7</td><td class="dpos">+71.9</td><td>9503.6</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>strong-x-none</td><td>58987.1</td><td class="dpos">+52.3</td><td>55300/59144/62603</td><td class="dpos">+11</td><td>7787.7</td><td class="dneg">−7.0</td><td>40336.8</td><td class="dpos">+64.0</td><td>9502.4</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>medium-x-none</td><td>58951.8</td><td class="dpos">+17.0</td><td>55300/59071/62676</td><td class="dpos">+11</td><td>7789.8</td><td class="dneg">−4.9</td><td>40299.7</td><td class="dpos">+26.8</td><td>9496.8</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>mild-x-none</td><td>58935.1</td><td class="dpos">+0.3</td><td>55249/59043/62676</td><td class="dneg">−40</td><td>7789.3</td><td class="dneg">−5.4</td><td>40285.0</td><td class="dpos">+12.1</td><td>9494.3</td><td><span class="badge b-no">否</span></td></tr>
+<tr class="base"><td>neutral-x-none（基线）</td><td>58934.8</td><td>+0.0</td><td>55289/58982/62603</td><td>+0</td><td>7794.7</td><td>+0.0</td><td>40272.9</td><td>+0.0</td><td>9492.8</td><td><span class="badge b-no">对照</span></td></tr>
+<tr><td>mild-x-gap100-over75</td><td>58933.6</td><td class="dneg">−1.2</td><td>55232/59022/62603</td><td class="dneg">−57</td><td>7782.4</td><td class="dneg">−12.3</td><td>40297.4</td><td class="dpos">+24.5</td><td>9495.8</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>medium-x-overflow50</td><td>58929.6</td><td class="dneg">−5.3</td><td>55289/59023/62676</td><td>+0</td><td>7785.1</td><td class="dneg">−9.6</td><td>40286.2</td><td class="dpos">+13.3</td><td>9494.6</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>neutral-x-overflow50</td><td>58928.8</td><td class="dneg">−6.0</td><td>55399/59006/62603</td><td class="dpos">+110</td><td>7791.8</td><td class="dneg">−2.9</td><td>40269.9</td><td class="dneg">−3.0</td><td>9492.3</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>medium-x-gap100-over75</td><td>58927.9</td><td class="dneg">−6.9</td><td>55158/59022/62603</td><td class="dneg">−131</td><td>7780.8</td><td class="dneg">−14.0</td><td>40294.7</td><td class="dpos">+21.8</td><td>9495.2</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>mild-x-overflow50</td><td>58920.0</td><td class="dneg">−14.8</td><td>55289/59022/62676</td><td>+0</td><td>7786.0</td><td class="dneg">−8.8</td><td>40275.1</td><td class="dpos">+2.2</td><td>9492.4</td><td><span class="badge b-no">否</span></td></tr>
+<tr><td>neutral-x-gap100-over75</td><td>58905.1</td><td class="dneg">−29.7</td><td>55240/59015/62575</td><td class="dneg">−49</td><td>7783.0</td><td class="dneg">−11.8</td><td>40265.4</td><td class="dneg">−7.5</td><td>9491.4</td><td><span class="badge b-no">否</span></td></tr>
+</tbody>
+</table>
+</div>
+<p class="note">原跑晋级的 3 个变体（mild-gap100-over75 / neutral-gap100-over75 / neutral-overflow50）在本块 Δ = −1.2 / −29.7 / −6.0，全部翻车——原晋级为噪声晋级的直接实证。12/12 无一晋级：负噪声块上判据批量收紧。</p>
+
+<h2>三、88802 块明细（run 34820748183，37/37 绿）</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>变体</th><th>平均分</th><th>Δ分</th><th>P10/P50/P90</th><th>ΔP10</th><th>平均PT</th><th>ΔPT</th><th>属性评分</th><th>Δ属性</th><th>五维和</th><th>晋级</th></tr></thead>
+<tbody>
+<tr><td>medium-x-overflow50</td><td>58975.0</td><td class="dpos">+84.7</td><td>55237/59396/62257</td><td class="dpos">+142</td><td>7789.3</td><td class="dpos">+6.4</td><td>40307.2</td><td class="dpos">+65.4</td><td>9497.0</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>medium-x-none</td><td>58969.1</td><td class="dpos">+78.8</td><td>55280/59281/62195</td><td class="dpos">+185</td><td>7788.1</td><td class="dpos">+5.2</td><td>40304.5</td><td class="dpos">+62.8</td><td>9496.7</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>neutral-x-gap100-over75</td><td>58963.4</td><td class="dpos">+73.1</td><td>55219/59398/62195</td><td class="dpos">+124</td><td>7788.4</td><td class="dpos">+5.4</td><td>40296.2</td><td class="dpos">+54.4</td><td>9495.5</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>strong-x-none</td><td>58957.5</td><td class="dpos">+67.2</td><td>55095/59282/62289</td><td>+0</td><td>7786.8</td><td class="dpos">+3.8</td><td>40297.0</td><td class="dpos">+55.3</td><td>9494.8</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>medium-x-gap100-over75</td><td>58955.8</td><td class="dpos">+65.5</td><td>55237/59396/62289</td><td class="dpos">+142</td><td>7787.8</td><td class="dpos">+4.9</td><td>40289.4</td><td class="dpos">+47.7</td><td>9494.0</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>mild-x-overflow50</td><td>58953.3</td><td class="dpos">+63.0</td><td>55219/59396/62257</td><td class="dpos">+124</td><td>7788.1</td><td class="dpos">+5.1</td><td>40289.6</td><td class="dpos">+47.9</td><td>9494.3</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>strong-x-overflow50</td><td>58952.1</td><td class="dpos">+61.8</td><td>55149/59282/62372</td><td class="dpos">+54</td><td>7787.3</td><td class="dpos">+4.4</td><td>40291.3</td><td class="dpos">+49.5</td><td>9493.4</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>neutral-x-overflow50</td><td>58940.3</td><td class="dpos">+50.1</td><td>55219/59282/62257</td><td class="dpos">+124</td><td>7787.7</td><td class="dpos">+4.8</td><td>40281.1</td><td class="dpos">+39.4</td><td>9493.0</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>mild-x-gap100-over75</td><td>58926.6</td><td class="dpos">+36.3</td><td>55219/59396/62257</td><td class="dpos">+124</td><td>7785.9</td><td class="dpos">+2.9</td><td>40264.2</td><td class="dpos">+22.4</td><td>9490.0</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>mild-x-none</td><td>58921.9</td><td class="dpos">+31.6</td><td>55219/59281/62195</td><td class="dpos">+124</td><td>7783.9</td><td class="dpos">+0.9</td><td>40268.6</td><td class="dpos">+26.9</td><td>9490.6</td><td><span class="badge b-ok">晋</span></td></tr>
+<tr><td>strong-x-gap100-over75</td><td>58913.1</td><td class="dpos">+22.8</td><td>55095/59282/62372</td><td>+0</td><td>7782.0</td><td class="dneg">−0.9</td><td>40263.2</td><td class="dpos">+21.4</td><td>9488.8</td><td><span class="badge b-no">否</span></td></tr>
+<tr class="base"><td>neutral-x-none（基线）</td><td>58890.3</td><td>+0.0</td><td>55095/59170/62257</td><td>+0</td><td>7782.9</td><td>+0.0</td><td>40241.7</td><td>+0.0</td><td>9485.9</td><td><span class="badge b-no">对照</span></td></tr>
+</tbody>
+</table>
+</div>
+<p class="note">10/12 晋级：正噪声块上判据批量放水。strong-x-gap100-over75 因 ΔPT −0.9 成为唯一被压的 strong 变体，而它的 +22.8 在 12 变体里排倒数第二——判据压掉的恰好不是最强的信号。</p>
+
+<h2>四、CRN 逐局配对检验（决定性证据）</h2>
+<p>每局 CSV 同时记录两个策略在同一随机流下的结果：a 列 = 手写基线（RamenHandwrittenTrainer）、b 列 = 变体（PhaseTrainer），同局面天然配对。对 72 个 CSV（36 变体-分片 × 2 块）做逐局配对差分 t 检验：</p>
+<div class="cards">
+  <div class="card"><div class="num c-red">|t| &lt; 1.0</div><div class="lbl">77701 块全部 11 个变体</div><div class="note">无一接近显著</div></div>
+  <div class="card"><div class="num c-red">t = 2.0</div><div class="lbl">88802 块最高值（medium-x-overflow50）</div><div class="note">p≈0.046 边缘，多重比较后不显著</div></div>
+  <div class="card"><div class="num">±40 分</div><div class="lbl">配对标准误</div><div class="note">大于变体间真实差异 0~85 分</div></div>
+  <div class="card"><div class="num c-blue">t≈50</div><div class="lbl">PhaseTrainer vs 手写基线 +8200 分</div><div class="note">大盘差异碾压性显著</div></div>
+</div>
+<div class="callout"><strong>a 列的意外发现：</strong>每次实验都在免费附带跑手写基线（36 job × 300 局），但历史 summary 和全部固化报告从未使用过这列数据——「PhaseTrainer 家族整体领先手写策略 8200 分（12%+）、PT 领先 1100（t≈63）」这个最大盘的结论一直躺在 CSV 里没人看。</div>
+
+<h2>五、误杀清单终版（7 项）</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>#</th><th>对象</th><th>终版定谳</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>v40 原晋级 3 种子（mild/neutral gap 系等）</td><td>噪声晋级，弃置无实际损失但流程错误</td></tr>
+<tr><td>2</td><td>v40 strong 系 9 个变体</td><td>边缘信号（三块恒正 +56~64），需 n=900 复跑定谳；「PT 一票否决冤杀」说法高估</td></tr>
+<tr><td>3</td><td>v40 晋级判据本身</td><td>n=300 无分辨力；只比均值差，浪费 CRN 配对数据——<strong>最高优先级修复</strong></td></tr>
+<tr><td>4</td><td>v44 crossstep / crossrmj 三变体逐位相同</td><td>组合信息丢失（真异常，待原始 CSV 复核）</td></tr>
+<tr><td>5</td><td>EXP-011 ens3</td><td>冤杀（只差 bench 被跳过）；复核数据已备齐在盘</td></tr>
+<tr><td>6</td><td>第三年 PT16 截断</td><td>停止规则 bug，PT&lt;16 空间从未探索</td></tr>
+<tr><td>7</td><td>composition-gap 4082 候选</td><td>去向不明，待追</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>六、待拍板的两个行动</h2>
+<ol>
+  <li><strong>strong 系高功效复跑</strong>：n=900/变体（3 变体 × 900 局），把 +60 量级的信号钉死到 95% 置信。基建复用本次 workbench/v40-recheck（c62e3ee），改 RUNS_PER_SHARD 即可。</li>
+  <li><strong>晋级判据 CRN 化</strong>：summary job 里加逐局配对差分的均值/标准误/p 值输出（数据已在 CSV，只改统计代码）。300 局即可获得正确显著性，一劳永逸修掉「噪声晋级 + 噪声否决」双重缺陷。</li>
+</ol>
+
+<p class="meta">产物索引：72 个逐局 CSV 与两块原始 summary 在 v40复跑数据包_20260914.zip 及 ci_data_assets/（crn_csvs/、recheck_results/）；完整审计过程见 ci_data_assets/night_watch_log.md（12 段）。</p>
+
+</body>
+</html>
